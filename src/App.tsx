@@ -1857,6 +1857,14 @@ export default function App() {
           onImportProjectJson={async (imported) => {
             await handleCreateNewLocalProject(imported, false);
           }}
+          onQuickImportGalleryMedia={async (file) => {
+            setActiveScreen('editor');
+            await handleUniversalCharacterUpload(file);
+          }}
+          onQuickImportPhoneAudio={async (file) => {
+            setActiveScreen('editor');
+            await handleUploadMediaFile(file);
+          }}
         />
       </>
     );
@@ -1868,10 +1876,10 @@ export default function App() {
       <video ref={videoRef} playsInline crossOrigin="anonymous" className="hidden" />
 
       {/* =====================================================================
-          1. EXACT CAPCUT TOP HEADER BAR: [ Home / Projects ] [ Save ] [ + Character ] ......... [ AI UHD ▾ ] [ Export ]
+          1. EXACT CAPCUT TOP HEADER BAR: [ Home / Projects ] [ Save ] [ + Gallery Photo/Video ] [ + Audio ] ......... [ AI UHD ▾ ] [ Export ]
          ===================================================================== */}
       <header className="h-14 px-4 bg-[#0D0D0F] flex items-center justify-between shrink-0 z-30">
-        <div className="flex items-center gap-2.5 sm:gap-3">
+        <div className="flex items-center gap-2 sm:gap-2.5">
           <button
             type="button"
             onClick={async () => {
@@ -1880,7 +1888,7 @@ export default function App() {
               await handleSaveCurrentProjectLocally(true);
               setActiveScreen('home');
             }}
-            title="হোম ড্যাশবোর্ড ও সেভ করা প্রজেক্ট লিস্টে ফিরে যান"
+            title="হোম ড্যাশবোর্ড ও পারমিশন সেটিংস-এ ফিরে যান"
             className="px-2.5 py-1.5 rounded-lg bg-[#1A1C23] hover:bg-[#242731] border border-zinc-700/90 text-xs font-bold text-white flex items-center gap-1.5 cursor-pointer transition-colors"
           >
             <FolderOpen className="w-3.5 h-3.5 text-[#00E1FA]" />
@@ -1897,26 +1905,17 @@ export default function App() {
             <span className="hidden sm:inline">Save Local</span>
           </button>
 
-          <span className="hidden md:inline text-xs font-bold text-zinc-300 max-w-[170px] truncate border-l border-zinc-800 pl-2.5">
+          <span className="hidden lg:inline text-xs font-bold text-zinc-300 max-w-[150px] truncate border-l border-zinc-800 pl-2.5">
             {activeProjectName}
           </span>
 
-          <button
-            type="button"
-            onClick={() => {
-              setSettingsSection('auto-listing');
-              setSettingsOpen(true);
-            }}
-            title="মাউথ চার্ট অটো-লিস্টিং ও কোড খুঁজুন"
-            className="text-zinc-200 hover:text-white transition-colors cursor-pointer"
+          {/* Direct Native Label Button to Open Mobile Phone Gallery (Photo or Video) */}
+          <label
+            title="ফোনের গ্যালারি থেকে ফটো বা ভিডিও নিন"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#1F2026] hover:bg-[#2A2C34] border border-zinc-700 text-xs font-semibold text-[#00E1FA] cursor-pointer"
           >
-            <Search className="w-5 h-5 stroke-[2]" />
-          </button>
-
-          {/* Direct Native Label Button to Upload ANY Character Format (Image, GIF, SVG, or Video) */}
-          <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1F2026] hover:bg-[#2A2C34] border border-zinc-700 text-xs font-semibold text-[#00E1FA] cursor-pointer">
             <UserPlus className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">+ ক্যারেক্টার আপলোড</span>
+            <span className="hidden sm:inline">+ গ্যালারি ফটো/ভিডিও</span>
             <input
               type="file"
               accept="image/*,video/*,.png,.jpg,.jpeg,.webp,.gif,.svg,.bmp,.avif,.mp4,.webm,.mov,.mkv"
@@ -1926,6 +1925,27 @@ export default function App() {
               onChange={(e) => {
                 const f = e.target.files?.[0];
                 if (f) handleUniversalCharacterUpload(f);
+              }}
+              className="hidden"
+            />
+          </label>
+
+          {/* Direct Native Label Button to Open Phone Audio / Music */}
+          <label
+            title="ফোনের মেমরি থেকে অডিও বা ভয়েস ফাইল নিন"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#1F2026] hover:bg-[#2A2C34] border border-zinc-700 text-xs font-semibold text-emerald-300 cursor-pointer"
+          >
+            <Music className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">+ ফোনের অডিও</span>
+            <input
+              type="file"
+              accept="audio/*,video/*,.mp3,.wav,.m4a,.aac,.ogg,.opus,.flac"
+              onClick={(e) => {
+                e.currentTarget.value = '';
+              }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleUploadMediaFile(f);
               }}
               className="hidden"
             />
