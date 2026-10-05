@@ -8,6 +8,8 @@ import {
   EXPORT_RESOLUTIONS,
   ExportResolutionId,
   EngineConfig,
+  IsolatedMotionRegion,
+  IsolatedPinMotionType,
   LipSyncCue,
   LipstickStyleConfig,
   LocalStudioProject,
@@ -32,6 +34,7 @@ import {
   StudioSoundPresetId,
   analyzeAudioBuffer,
   applyCuesToFrames,
+  applySmartLiftingEnvelope,
   audioBufferToWavBlob,
   createDemoSpeechAudioBuffer,
   createStudioSoundFxBuffer,
@@ -104,6 +107,9 @@ const INITIAL_CONFIG: EngineConfig = {
   peakThresholdDb: -14,
   maxLiftPx: 0,
   liftingTarget: 'character-and-mouth',
+  liftingCurveMode: 'smart-organic',
+  liftingSmoothness: 88,
+  smartAutoListing: true,
   perKeyLiftPx: { ...DEFAULT_PER_KEY_LIFT },
   squashIntensity: 0,
   holdSmoothingFrames: 2,
@@ -722,6 +728,11 @@ export default function App() {
     config.peakThresholdDb,
     config.risingSensitivity,
     config.holdSmoothingFrames,
+    config.maxLiftPx,
+    config.layers.liftingLayer,
+    config.liftingCurveMode,
+    config.liftingSmoothness,
+    config.smartAutoListing,
   ]);
 
   // TIMELINE SLASH / SPLIT TOOL HANDLERS ("split video clips on the timeline using a slash/split tool")
@@ -1270,20 +1281,32 @@ export default function App() {
   );
 
   const handleUpdatePerKeyLift = useCallback((viseme: VisemeCode, liftPx: number) => {
-    setConfig((prev) => ({
-      ...prev,
+    const nextConfig: EngineConfig = {
+      ...configRef.current,
       perKeyLiftPx: {
-        ...prev.perKeyLiftPx,
+        ...configRef.current.perKeyLiftPx,
         [viseme]: Math.max(0, Math.min(60, liftPx)),
       },
-    }));
+    };
+    setConfig(nextConfig);
+    setFrames((prevFrames) => {
+      const cloned = prevFrames.map((f) => ({ ...f }));
+      applySmartLiftingEnvelope(cloned, nextConfig);
+      return cloned;
+    });
   }, []);
 
   const handleResetPerKeyLift = useCallback(() => {
-    setConfig((prev) => ({
-      ...prev,
+    const nextConfig: EngineConfig = {
+      ...configRef.current,
       perKeyLiftPx: { ...DEFAULT_PER_KEY_LIFT },
-    }));
+    };
+    setConfig(nextConfig);
+    setFrames((prevFrames) => {
+      const cloned = prevFrames.map((f) => ({ ...f }));
+      applySmartLiftingEnvelope(cloned, nextConfig);
+      return cloned;
+    });
   }, []);
 
   const handleUpdateLipstickStyle = useCallback((patch: Partial<LipstickStyleConfig>) => {
@@ -2066,6 +2089,7 @@ export default function App() {
                   { id: 'mouth', label: '👄 Mouth Layer' },
                   { id: 'lip-segment', label: '🫦 Lip Segment' },
                   { id: 'character', label: '🧍 Character Layer' },
+                  { id: 'isolated-region', label: '🎯 Isolate & Drag' },
                   { id: 'background', label: '🖼️ Background Layer' },
                   { id: 'none', label: '✓ Clean View' },
                 ] as const
@@ -2875,27 +2899,35 @@ export default function App() {
                 <>
                   <span className="absolute left-2 z-10 text-[9px] font-bold text-purple-200 drop-shadow pointer-events-none flex items-center gap-1">
                     <ArrowUpFromLine className="w-2.5 h-2.5 text-purple-300" />
-                    <span>Lifting Layer · +{config.maxLiftPx}px</span>
+                    <span>
+                      Smart Lifting · +{config.maxLiftPx}px · Smooth{' '}
+                      {config.liftingSmoothness ?? 88}% (
+                      {config.liftingCurveMode || 'smart-organic'})
+                    </span>
                   </span>
 
                   {frames.map((fr) => {
-                    const keyVal = config.perKeyLiftPx?.[fr.viseme] ?? 0;
-                    const liftRatio = fr.isDropped
-                      ? 0.08
-                      : Math.max(
-                          0.16,
-                          Math.min(0.95, (keyVal / 35) * (config.maxLiftPx / 28))
-                        );
+                    const smoothVal = fr.liftY ?? 0;
+                    const liftRatio =
+                      smoothVal <= 0.1
+                        ? 0.08
+                        : Math.max(
+                            0.14,
+                            Math.min(
+                              0.96,
+                              smoothVal / Math.max(14, config.maxLiftPx * 1.05)
+                            )
+                          );
                     return (
                       <div
                         key={fr.frame}
                         style={{ height: `${Math.round(liftRatio * 100)}%` }}
-                        className={`flex-1 rounded-full ${
-                          fr.isDropped
+                        className={`flex-1 rounded-full transition-all duration-75 ${
+                          smoothVal <= 0.1
                             ? 'bg-purple-500/15'
                             : fr.frame <= currentFrameIndex
                             ? 'bg-purple-400'
-                            : 'bg-purple-500/60'
+                            : 'bg-purple-500/65'
                         }`}
                       />
                     );
@@ -3825,14 +3857,42 @@ export default function App() {
 
                   <div className="p-2.5 rounded-xl bg-[#1F2026] border border-zinc-800 space-y-2">
                     <div className="text-[11px] font-bold text-purple-300">
-                      ২. রেডিমেড লিফটিং প্রিসেট (Quick Presets):
+                      ২. রেডিমেড স্মার্ট লিফটিং প্রিসেট (Smart Presets):
                     </div>
                     <div className="flex flex-wrap gap-1.5">
                       {[
-                        { label: 'স্থির (0px)', lift: 0, squash: 0, on: false },
-                        { label: 'হালকা কথা (12px)', lift: 12, squash: 0.04, on: true },
-                        { label: 'কার্টুন বাউন্স (22px)', lift: 22, squash: 0.1, on: true },
-                        { label: 'হাই এনার্জি (35px)', lift: 35, squash: 0.16, on: true },
+                        {
+                          label: 'স্থির (0px)',
+                          lift: 0,
+                          squash: 0,
+                          smooth: 88,
+                          mode: 'smart-organic' as const,
+                          on: false,
+                        },
+                        {
+                          label: '✨ স্মার্ট ন্যাচারাল (14px)',
+                          lift: 14,
+                          squash: 0.05,
+                          smooth: 92,
+                          mode: 'smart-organic' as const,
+                          on: true,
+                        },
+                        {
+                          label: '🪶 আলট্রা স্মুথ গ্লাইড (18px)',
+                          lift: 18,
+                          squash: 0.06,
+                          smooth: 96,
+                          mode: 'feather-glide' as const,
+                          on: true,
+                        },
+                        {
+                          label: '🏀 ইলাস্টিক স্প্রিং (24px)',
+                          lift: 24,
+                          squash: 0.11,
+                          smooth: 86,
+                          mode: 'spring-bounce' as const,
+                          on: true,
+                        },
                       ].map((pr) => (
                         <button
                           key={pr.label}
@@ -3842,6 +3902,9 @@ export default function App() {
                               ...prev,
                               maxLiftPx: pr.lift,
                               squashIntensity: pr.squash,
+                              liftingSmoothness: pr.smooth,
+                              liftingCurveMode: pr.mode,
+                              smartAutoListing: true,
                               layers: {
                                 ...prev.layers,
                                 liftingLayer: pr.on,
@@ -3862,8 +3925,78 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Master Lifting Power, Squash & Smoothness Sliders */}
-                <div className="p-2.5 rounded-xl bg-[#1F2026] border border-zinc-800 grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {/* Smart Physics Curve Mode & Auto-Listing Intelligence Bar */}
+                <div className="p-2.5 rounded-xl bg-[#221730] border border-purple-400/40 flex flex-wrap items-center justify-between gap-2.5">
+                  <div className="space-y-1">
+                    <div className="text-[11px] font-bold text-purple-200 flex items-center gap-1.5">
+                      <span>🧠 Smart Lifting Physics & Auto-Listing Mode (রোবটিক ভাব দূর করুন):</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {(
+                        [
+                          {
+                            id: 'smart-organic',
+                            label: '✨ Smart Organic (Spring + S-Curve)',
+                          },
+                          {
+                            id: 'feather-glide',
+                            label: '🪶 Feather Glide (Ultra Smooth)',
+                          },
+                          {
+                            id: 'spring-bounce',
+                            label: '🏀 Elastic Follow-Through',
+                          },
+                          {
+                            id: 'classic-linear',
+                            label: '📐 Classic Linear',
+                          },
+                        ] as const
+                      ).map((cm) => (
+                        <button
+                          key={cm.id}
+                          type="button"
+                          onClick={() =>
+                            setConfig((prev) => ({
+                              ...prev,
+                              liftingCurveMode: cm.id,
+                              maxLiftPx: prev.maxLiftPx > 0 ? prev.maxLiftPx : 16,
+                              layers: { ...prev.layers, liftingLayer: true },
+                            }))
+                          }
+                          className={`px-2.5 py-1 rounded-lg text-[10px] font-bold cursor-pointer ${
+                            (config.liftingCurveMode || 'smart-organic') === cm.id
+                              ? 'bg-purple-400 text-zinc-950'
+                              : 'bg-zinc-900 text-zinc-300 border border-zinc-700 hover:text-white'
+                          }`}
+                        >
+                          {cm.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setConfig((prev) => ({
+                        ...prev,
+                        smartAutoListing: prev.smartAutoListing === false,
+                      }))
+                    }
+                    className={`px-3 py-1.5 rounded-xl text-[10px] font-bold border cursor-pointer ${
+                      config.smartAutoListing !== false
+                        ? 'bg-emerald-400/20 border-emerald-400 text-emerald-200'
+                        : 'bg-zinc-900 border-zinc-700 text-zinc-400'
+                    }`}
+                  >
+                    {config.smartAutoListing !== false
+                      ? '✓ Smart Auto-Listing Co-articulation: ON'
+                      : 'Smart Auto-Listing: OFF'}
+                  </button>
+                </div>
+
+                {/* Master Lifting Power, Spring Smoothness, Squash & Hold Sliders */}
+                <div className="p-2.5 rounded-xl bg-[#1F2026] border border-zinc-800 grid grid-cols-1 sm:grid-cols-4 gap-3">
                   <div className="space-y-1">
                     <div className="flex items-center justify-between text-[11px]">
                       <span className="text-zinc-300 font-semibold">মাস্টার লিফটিং পাওয়ার:</span>
@@ -3894,6 +4027,29 @@ export default function App() {
 
                   <div className="space-y-1">
                     <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-zinc-300 font-semibold">স্মার্ট স্প্রিং স্মুথনেস:</span>
+                      <span className="font-mono font-bold text-emerald-300">
+                        {config.liftingSmoothness ?? 88}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={15}
+                      max={100}
+                      step={1}
+                      value={config.liftingSmoothness ?? 88}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          liftingSmoothness: Number(e.target.value),
+                        }))
+                      }
+                      className="w-full accent-emerald-400 cursor-pointer"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
                       <span className="text-zinc-300 font-semibold">স্কোয়াশ ও স্ট্রেচ বাউন্স:</span>
                       <span className="font-mono font-bold text-purple-300">
                         {Math.round(config.squashIntensity * 100)}%
@@ -3917,7 +4073,7 @@ export default function App() {
 
                   <div className="space-y-1">
                     <div className="flex items-center justify-between text-[11px]">
-                      <span className="text-zinc-300 font-semibold">স্মুথনেস (Hold Frames):</span>
+                      <span className="text-zinc-300 font-semibold">হোল্ড স্মুথনেস (Frames):</span>
                       <span className="font-mono font-bold text-purple-300">
                         {config.holdSmoothingFrames}f
                       </span>
@@ -4745,6 +4901,319 @@ export default function App() {
                           </div>
                         </div>
                       </div>
+
+                      {/* 3. SELECTIVELY ISOLATE & ANIMATE STATIC IMAGE ELEMENTS (TAP-AND-DRAG CONTROLS) */}
+                      <div className="p-3 rounded-xl bg-[#182229] border border-emerald-500/45 space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <div className="font-bold text-emerald-300 text-xs flex items-center gap-1.5">
+                              <span>
+                                🎯 Selectively Isolate & Animate Image Elements (Tap & Drag)
+                              </span>
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-200 text-[9px] font-mono">
+                                {(proc.isolatedRegions || []).length} pins
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-zinc-300">
+                              স্থির ছবির (Static Image) যেকোনো নির্দিষ্ট অংশ বা অঙ্গ আলাদা (Isolate) করে ক্যানভাসে ট্যাপ ও ড্র্যাগ করে ন্যাচারাল মুভমেন্ট দিন
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const nextMode =
+                                  selectedCanvasLayer === 'isolated-region'
+                                    ? 'none'
+                                    : 'isolated-region';
+                                setSelectedCanvasLayer(nextMode);
+                                if (nextMode === 'isolated-region') {
+                                  handleUpdateProceduralAnimation({
+                                    enabled: true,
+                                  });
+                                  showNotice(
+                                    '🎯 Tap & Drag Mode চালু হয়েছে! এখন ছবির যেকোনো অংশে ট্যাপ ও ড্র্যাগ করে অ্যানিমেট করুন।'
+                                  );
+                                }
+                              }}
+                              className={`px-3 py-1.5 rounded-lg font-bold text-[11px] cursor-pointer transition-colors ${
+                                selectedCanvasLayer === 'isolated-region'
+                                  ? 'bg-emerald-400 text-zinc-950 shadow-md ring-2 ring-white/80'
+                                  : 'bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-200'
+                              }`}
+                            >
+                              {selectedCanvasLayer === 'isolated-region'
+                                ? '✓ Tap & Drag on Canvas: ACTIVE'
+                                : '🎯 Enable Tap & Drag on Canvas'}
+                            </button>
+
+                            {(proc.isolatedRegions || []).length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleUpdateProceduralAnimation({
+                                    isolatedRegions: [],
+                                  });
+                                  showNotice(
+                                    '🗑️ সব আইসোলেটেড অ্যানিমেশন পিন ক্লিয়ার করা হয়েছে'
+                                  );
+                                }}
+                                className="px-2.5 py-1.5 rounded-lg bg-rose-600/80 hover:bg-rose-500 text-white font-bold text-[10px] cursor-pointer"
+                              >
+                                Clear All Pins
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Quick One-Tap Element Isolation Presets */}
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="text-[10px] text-zinc-400 font-semibold mr-1">
+                            Quick Add Isolated Part:
+                          </span>
+                          {(
+                            [
+                              {
+                                label: '+ 👋 Hand / Arm Wave',
+                                title: 'Hand / Arm',
+                                ax: 0.35,
+                                ay: 0.72,
+                                r: 74,
+                                vx: 42,
+                                vy: -28,
+                                rot: 18,
+                                motionType: 'pendulum-sway' as IsolatedPinMotionType,
+                              },
+                              {
+                                label: '+ 💇 Hair / Lock Sway',
+                                title: 'Hair Lock',
+                                ax: 0.56,
+                                ay: 0.36,
+                                r: 80,
+                                vx: 34,
+                                vy: 14,
+                                rot: 14,
+                                motionType: 'sine-float' as IsolatedPinMotionType,
+                              },
+                              {
+                                label: '+ 🎭 Head / Upper Nod',
+                                title: 'Head / Upper',
+                                ax: 0.5,
+                                ay: 0.43,
+                                r: 94,
+                                vx: 16,
+                                vy: 24,
+                                rot: 12,
+                                motionType: 'audio-bounce' as IsolatedPinMotionType,
+                              },
+                              {
+                                label: '+ 🌿 Prop / Object Float',
+                                title: 'Object / Prop',
+                                ax: 0.66,
+                                ay: 0.64,
+                                r: 68,
+                                vx: 28,
+                                vy: -22,
+                                rot: 15,
+                                motionType: 'circular-orbit' as IsolatedPinMotionType,
+                              },
+                            ] as const
+                          ).map((preset) => (
+                            <button
+                              key={preset.title}
+                              type="button"
+                              onClick={() => {
+                                const newReg: IsolatedMotionRegion = {
+                                  id: `iso-${Date.now().toString(36)}-${Math.random()
+                                    .toString(36)
+                                    .slice(2, 5)}`,
+                                  label: preset.title,
+                                  anchorX: preset.ax,
+                                  anchorY: preset.ay,
+                                  radiusPx: preset.r,
+                                  dragVectorX: preset.vx,
+                                  dragVectorY: preset.vy,
+                                  rotationAmpDeg: preset.rot,
+                                  speedHz: 1.35,
+                                  motionType: preset.motionType,
+                                  patchInfill: true,
+                                  enabled: true,
+                                };
+                                handleUpdateProceduralAnimation({
+                                  enabled: true,
+                                  isolatedRegions: [
+                                    ...(proc.isolatedRegions || []),
+                                    newReg,
+                                  ],
+                                });
+                                setSelectedCanvasLayer('isolated-region');
+                                showNotice(
+                                  `✨ "${preset.title}" আইসোলেট পিন যোগ হয়েছে! ক্যানভাসে ট্যাপ ও ড্র্যাগ করে পজিশন ও দিক পরিবর্তন করুন।`
+                                );
+                              }}
+                              className="px-2.5 py-1 rounded-lg bg-[#1F2026] hover:bg-zinc-800 border border-zinc-700 text-zinc-200 text-[10px] font-semibold cursor-pointer"
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        {/* List of Active Isolated Elements with Fine Controls */}
+                        {(proc.isolatedRegions || []).length > 0 && (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                            {(proc.isolatedRegions || []).map((reg, idx) => (
+                              <div
+                                key={reg.id}
+                                className="p-2.5 rounded-xl bg-[#14191F] border border-emerald-500/30 space-y-2"
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="font-bold text-emerald-300 text-[11px]">
+                                    #{idx + 1} · {reg.label} (R:{reg.radiusPx}px)
+                                  </span>
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const next = (
+                                          proc.isolatedRegions || []
+                                        ).map((r) =>
+                                          r.id === reg.id
+                                            ? { ...r, enabled: !r.enabled }
+                                            : r
+                                        );
+                                        handleUpdateProceduralAnimation({
+                                          isolatedRegions: next,
+                                        });
+                                      }}
+                                      className={`px-2 py-0.5 rounded text-[9px] font-bold cursor-pointer ${
+                                        reg.enabled
+                                          ? 'bg-emerald-400 text-zinc-950'
+                                          : 'bg-zinc-800 text-zinc-400'
+                                      }`}
+                                    >
+                                      {reg.enabled ? 'ON' : 'OFF'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const next = (
+                                          proc.isolatedRegions || []
+                                        ).filter((r) => r.id !== reg.id);
+                                        handleUpdateProceduralAnimation({
+                                          isolatedRegions: next,
+                                        });
+                                      }}
+                                      className="p-1 rounded bg-rose-600/80 hover:bg-rose-500 text-white cursor-pointer"
+                                      title="Delete Isolated Element"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* Motion Type Selector */}
+                                <div className="flex flex-wrap gap-1">
+                                  {(
+                                    [
+                                      { id: 'pendulum-sway', label: 'Pendulum' },
+                                      { id: 'sine-float', label: 'Sine Wave' },
+                                      { id: 'audio-bounce', label: 'Audio Sync' },
+                                      { id: 'circular-orbit', label: 'Orbit' },
+                                      { id: 'manual-pose', label: 'Hold Pose' },
+                                    ] as const
+                                  ).map((mt) => (
+                                    <button
+                                      key={mt.id}
+                                      type="button"
+                                      onClick={() => {
+                                        const next = (
+                                          proc.isolatedRegions || []
+                                        ).map((r) =>
+                                          r.id === reg.id
+                                            ? { ...r, motionType: mt.id }
+                                            : r
+                                        );
+                                        handleUpdateProceduralAnimation({
+                                          isolatedRegions: next,
+                                        });
+                                      }}
+                                      className={`px-1.5 py-0.5 rounded text-[9px] font-semibold cursor-pointer ${
+                                        reg.motionType === mt.id
+                                          ? 'bg-emerald-400 text-zinc-950'
+                                          : 'bg-zinc-900 text-zinc-400 border border-zinc-800'
+                                      }`}
+                                    >
+                                      {mt.label}
+                                    </button>
+                                  ))}
+                                </div>
+
+                                {/* Radius & Rotation Sliders */}
+                                <div className="grid grid-cols-2 gap-2 text-[10px]">
+                                  <div>
+                                    <div className="flex justify-between text-zinc-400">
+                                      <span>Size (Radius):</span>
+                                      <span className="font-mono text-emerald-300">
+                                        {reg.radiusPx}px
+                                      </span>
+                                    </div>
+                                    <input
+                                      type="range"
+                                      min={24}
+                                      max={220}
+                                      value={reg.radiusPx}
+                                      onChange={(e) => {
+                                        const val = Number(e.target.value);
+                                        const next = (
+                                          proc.isolatedRegions || []
+                                        ).map((r) =>
+                                          r.id === reg.id
+                                            ? { ...r, radiusPx: val }
+                                            : r
+                                        );
+                                        handleUpdateProceduralAnimation({
+                                          isolatedRegions: next,
+                                        });
+                                      }}
+                                      className="w-full accent-emerald-400 cursor-pointer"
+                                    />
+                                  </div>
+
+                                  <div>
+                                    <div className="flex justify-between text-zinc-400">
+                                      <span>Tilt Angle:</span>
+                                      <span className="font-mono text-emerald-300">
+                                        {reg.rotationAmpDeg}°
+                                      </span>
+                                    </div>
+                                    <input
+                                      type="range"
+                                      min={-45}
+                                      max={45}
+                                      value={reg.rotationAmpDeg}
+                                      onChange={(e) => {
+                                        const val = Number(e.target.value);
+                                        const next = (
+                                          proc.isolatedRegions || []
+                                        ).map((r) =>
+                                          r.id === reg.id
+                                            ? { ...r, rotationAmpDeg: val }
+                                            : r
+                                        );
+                                        handleUpdateProceduralAnimation({
+                                          isolatedRegions: next,
+                                        });
+                                      }}
+                                      className="w-full accent-emerald-400 cursor-pointer"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </>
                   );
                 })()}
@@ -4902,6 +5371,33 @@ export default function App() {
             }`}
           >
             <span>🖼️ BG Move</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              const next =
+                selectedCanvasLayer === 'isolated-region'
+                  ? 'none'
+                  : 'isolated-region';
+              setSelectedCanvasLayer(next);
+              if (next === 'isolated-region') {
+                handleUpdateProceduralAnimation({ enabled: true });
+                showNotice(
+                  '🎯 Isolate & Drag চালু হয়েছে — ছবির যেকোনো অংশে ট্যাপ ও ড্র্যাগ করে আলাদা মুভমেন্ট দিন!'
+                );
+              }
+            }}
+            className={`px-2 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 cursor-pointer shrink-0 transition-colors ${
+              selectedCanvasLayer === 'isolated-region'
+                ? 'bg-emerald-400 text-zinc-950 ring-1 ring-white'
+                : 'bg-[#1C1D23] text-emerald-300 hover:text-white border border-emerald-500/40'
+            }`}
+          >
+            <span>
+              🎯 Isolate & Drag (
+              {(config.proceduralAnimation?.isolatedRegions || []).length})
+            </span>
           </button>
 
           {selectedCanvasLayer !== 'none' && (

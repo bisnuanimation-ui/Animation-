@@ -1,22 +1,26 @@
 import React, { useRef, useState } from 'react';
 import {
   CharacterOverlayElement,
+  DEFAULT_PROCEDURAL_ANIMATION,
   EngineConfig,
   EXPORT_RESOLUTIONS,
+  IsolatedMotionRegion,
   MouthAnchorConfig,
   SelectedCanvasLayer,
   VisemeCode,
 } from '../types/studio';
-import { RotateCw, Trash2 } from 'lucide-react';
+import { Move, Navigation, RotateCw, Trash2 } from 'lucide-react';
 
 interface InteractiveStageOverlayProps {
   config: EngineConfig;
   isPlaying?: boolean;
   selectedLayer: SelectedCanvasLayer;
   selectedOverlayId: string | null;
+  selectedIsolatedRegionId?: string | null;
   characterOverlays: CharacterOverlayElement[];
   activeViseme: VisemeCode;
   onSelectLayer: (layer: SelectedCanvasLayer, overlayId?: string | null) => void;
+  onSelectIsolatedRegion?: (id: string | null) => void;
   onUpdateConfig: (updater: (prev: EngineConfig) => EngineConfig) => void;
   onUpdateMouthAnchor: (patch: Partial<MouthAnchorConfig>) => void;
   onUpdatePerKeyLift: (viseme: VisemeCode, liftPx: number) => void;
@@ -29,15 +33,24 @@ interface InteractiveStageOverlayProps {
   onCaptureTrackerTemplate: () => void;
 }
 
-type DragAction = 'move' | 'scale' | 'rotate' | null;
+type DragAction =
+  | 'move'
+  | 'scale'
+  | 'rotate'
+  | 'isolate-create-or-vector'
+  | 'isolate-move'
+  | 'isolate-radius'
+  | null;
 
 export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = ({
   config,
   isPlaying = false,
   selectedLayer,
   selectedOverlayId,
+  selectedIsolatedRegionId,
   characterOverlays,
   onSelectLayer,
+  onSelectIsolatedRegion,
   onUpdateConfig,
   onUpdateMouthAnchor,
   onUpdateOverlay,
@@ -48,18 +61,36 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [dragAction, setDragAction] = useState<DragAction>(null);
+  const [internalRegionId, setInternalRegionId] = useState<string | null>(null);
+
+  const activeRegionId =
+    selectedIsolatedRegionId !== undefined
+      ? selectedIsolatedRegionId
+      : internalRegionId;
+
+  const setActiveRegionId = (id: string | null) => {
+    setInternalRegionId(id);
+    if (onSelectIsolatedRegion) {
+      onSelectIsolatedRegion(id);
+    }
+  };
+
+  const isolatedRegions: IsolatedMotionRegion[] =
+    config.proceduralAnimation?.isolatedRegions || [];
 
   const dragStartRef = useRef<{
     clientX: number;
     clientY: number;
     activeLayer: SelectedCanvasLayer;
     activeOverlayId: string | null;
+    activeIsolatedId: string | null;
     startX: number;
     startY: number;
     startScale: number;
     startRotation: number;
     centerScreenX: number;
     centerScreenY: number;
+    isNewlyCreatedRegion?: boolean;
   } | null>(null);
 
   const resSpec =
@@ -137,6 +168,44 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
 
   const activeBox = getLayerMetrics(selectedLayer, selectedOverlay);
 
+  const updateIsolatedRegionById = (
+    regionId: string,
+    updater: (reg: IsolatedMotionRegion) => IsolatedMotionRegion
+  ) => {
+    onUpdateConfig((prev) => {
+      const currentProc =
+        prev.proceduralAnimation || DEFAULT_PROCEDURAL_ANIMATION;
+      const list = currentProc.isolatedRegions || [];
+      return {
+        ...prev,
+        proceduralAnimation: {
+          ...currentProc,
+          enabled: true,
+          isolatedRegions: list.map((r) => (r.id === regionId ? updater(r) : r)),
+        },
+      };
+    });
+  };
+
+  const deleteIsolatedRegionById = (regionId: string) => {
+    onUpdateConfig((prev) => {
+      const currentProc =
+        prev.proceduralAnimation || DEFAULT_PROCEDURAL_ANIMATION;
+      const list = currentProc.isolatedRegions || [];
+      const nextList = list.filter((r) => r.id !== regionId);
+      return {
+        ...prev,
+        proceduralAnimation: {
+          ...currentProc,
+          isolatedRegions: nextList,
+        },
+      };
+    });
+    if (activeRegionId === regionId) {
+      setActiveRegionId(null);
+    }
+  };
+
   // Direct hit-test on pointer down so ALL layers (Mouth/Lip, Overlays, Character, Background)
   // are directly selectable and movable anywhere on the preview screen!
   const hitTestStageLayer = (
@@ -144,7 +213,9 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
     normY: number,
     rect: DOMRect
   ): { layer: SelectedCanvasLayer; overlayId: string | null } => {
-    // If user explicitly chose 'tracker' or 'lip-segment' from the bottom panel, allow dragging it anywhere
+    if (selectedLayer === 'isolated-region') {
+      return { layer: 'isolated-region', overlayId: null };
+    }
     if (selectedLayer === 'tracker') {
       return { layer: 'tracker', overlayId: null };
     }
@@ -194,11 +265,144 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
     }
 
     // 4. If user clicked outside on background:
-    // If background layer is selected in bottom panel, move background; otherwise deselect bounding box
     if (selectedLayer === 'background') {
       return { layer: 'background', overlayId: null };
     }
     return { layer: 'none', overlayId: null };
+  };
+
+  // Tap-and-drag handler specifically for creating or manipulating isolated image elements
+  const beginIsolatedRegionPointerDown = (
+    e: React.PointerEvent,
+    mode: 'isolate-create-or-vector' | 'isolate-move' | 'isolate-radius',
+    existingRegion?: IsolatedMotionRegion
+  ) => {
+    e.stopPropagation();
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const normX = Math.max(
+      0.06,
+      Math.min(0.94, (e.clientX - rect.left) / Math.max(1, rect.width))
+    );
+    const normY = Math.max(
+      0.06,
+      Math.min(0.94, (e.clientY - rect.top) / Math.max(1, rect.height))
+    );
+
+    if (existingRegion) {
+      setActiveRegionId(existingRegion.id);
+      const centerScreenX = rect.left + existingRegion.anchorX * rect.width;
+      const centerScreenY = rect.top + existingRegion.anchorY * rect.height;
+
+      dragStartRef.current = {
+        clientX: e.clientX,
+        clientY: e.clientY,
+        activeLayer: 'isolated-region',
+        activeOverlayId: null,
+        activeIsolatedId: existingRegion.id,
+        startX: existingRegion.anchorX,
+        startY: existingRegion.anchorY,
+        startScale: existingRegion.radiusPx,
+        startRotation: existingRegion.rotationAmpDeg,
+        centerScreenX,
+        centerScreenY,
+        isNewlyCreatedRegion: false,
+      };
+      setDragAction(mode);
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      return;
+    }
+
+    // Check if user tapped inside an existing region first
+    for (let i = isolatedRegions.length - 1; i >= 0; i--) {
+      const reg = isolatedRegions[i];
+      const rxPx = (reg.radiusPx / 1280) * rect.width;
+      const ryPx = (reg.radiusPx / 720) * rect.height;
+      const cxPx = reg.anchorX * rect.width;
+      const cyPx = reg.anchorY * rect.height;
+      const clickPxX = normX * rect.width;
+      const clickPxY = normY * rect.height;
+      const distNorm = Math.hypot(
+        (clickPxX - cxPx) / Math.max(18, rxPx),
+        (clickPxY - cyPx) / Math.max(18, ryPx)
+      );
+      if (distNorm <= 0.85) {
+        setActiveRegionId(reg.id);
+        dragStartRef.current = {
+          clientX: e.clientX,
+          clientY: e.clientY,
+          activeLayer: 'isolated-region',
+          activeOverlayId: null,
+          activeIsolatedId: reg.id,
+          startX: reg.anchorX,
+          startY: reg.anchorY,
+          startScale: reg.radiusPx,
+          startRotation: reg.rotationAmpDeg,
+          centerScreenX: rect.left + cxPx,
+          centerScreenY: rect.top + cyPx,
+          isNewlyCreatedRegion: false,
+        };
+        setDragAction('isolate-create-or-vector');
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        return;
+      }
+    }
+
+    // Create a brand new isolated element at tap position and allow dragging to set natural motion vector!
+    const newId = `iso-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 5)}`;
+    const nextIndex = isolatedRegions.length + 1;
+    const newRegion: IsolatedMotionRegion = {
+      id: newId,
+      label: `Element #${nextIndex}`,
+      anchorX: Number(normX.toFixed(3)),
+      anchorY: Number(normY.toFixed(3)),
+      radiusPx: 76,
+      dragVectorX: 28,
+      dragVectorY: -18,
+      rotationAmpDeg: 14,
+      speedHz: 1.35,
+      motionType: 'pendulum-sway',
+      patchInfill: true,
+      enabled: true,
+    };
+
+    onUpdateConfig((prev) => {
+      const currentProc =
+        prev.proceduralAnimation || DEFAULT_PROCEDURAL_ANIMATION;
+      const list = currentProc.isolatedRegions || [];
+      return {
+        ...prev,
+        layers: {
+          ...prev.layers,
+          proceduralLayer: true,
+        },
+        proceduralAnimation: {
+          ...currentProc,
+          enabled: true,
+          isolatedRegions: [...list, newRegion],
+        },
+      };
+    });
+
+    setActiveRegionId(newId);
+    dragStartRef.current = {
+      clientX: e.clientX,
+      clientY: e.clientY,
+      activeLayer: 'isolated-region',
+      activeOverlayId: null,
+      activeIsolatedId: newId,
+      startX: newRegion.anchorX,
+      startY: newRegion.anchorY,
+      startScale: newRegion.radiusPx,
+      startRotation: newRegion.rotationAmpDeg,
+      centerScreenX: e.clientX,
+      centerScreenY: e.clientY,
+      isNewlyCreatedRegion: true,
+    };
+    setDragAction('isolate-create-or-vector');
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   };
 
   const beginPointerTransform = (
@@ -207,6 +411,14 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
     forcedLayer?: SelectedCanvasLayer,
     forcedOverlayId?: string | null
   ) => {
+    if (
+      (forcedLayer ?? selectedLayer) === 'isolated-region' &&
+      action === 'move'
+    ) {
+      beginIsolatedRegionPointerDown(e, 'isolate-create-or-vector');
+      return;
+    }
+
     e.stopPropagation();
     if (!containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
@@ -279,6 +491,7 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
       clientY: e.clientY,
       activeLayer: targetLayer,
       activeOverlayId: targetOvId,
+      activeIsolatedId: null,
       startX,
       startY,
       startScale,
@@ -299,6 +512,7 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
       clientY,
       activeLayer,
       activeOverlayId,
+      activeIsolatedId,
       startX,
       startY,
       startScale,
@@ -309,6 +523,74 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
 
     const dxNorm = (e.clientX - clientX) / Math.max(1, rect.width);
     const dyNorm = (e.clientY - clientY) / Math.max(1, rect.height);
+
+    // Handle Isolated Element Tap-and-Drag Controls
+    if (activeIsolatedId) {
+      if (dragAction === 'isolate-move') {
+        const nextAx = Number(
+          Math.max(0.05, Math.min(0.95, startX + dxNorm)).toFixed(3)
+        );
+        const nextAy = Number(
+          Math.max(0.05, Math.min(0.95, startY + dyNorm)).toFixed(3)
+        );
+        updateIsolatedRegionById(activeIsolatedId, (r) => ({
+          ...r,
+          anchorX: nextAx,
+          anchorY: nextAy,
+        }));
+        return;
+      }
+
+      if (dragAction === 'isolate-radius') {
+        const distPx = Math.hypot(
+          e.clientX - centerScreenX,
+          e.clientY - centerScreenY
+        );
+        const nextRadius = Math.round(
+          Math.max(24, Math.min(220, (distPx / Math.max(1, rect.width)) * 1280))
+        );
+        updateIsolatedRegionById(activeIsolatedId, (r) => ({
+          ...r,
+          radiusPx: nextRadius,
+        }));
+        return;
+      }
+
+      if (dragAction === 'isolate-create-or-vector') {
+        const vecX = Math.round(
+          Math.max(
+            -220,
+            Math.min(
+              220,
+              ((e.clientX - centerScreenX) / Math.max(1, rect.width)) * 1280
+            )
+          )
+        );
+        const vecY = Math.round(
+          Math.max(
+            -220,
+            Math.min(
+              220,
+              ((e.clientY - centerScreenY) / Math.max(1, rect.height)) * 720
+            )
+          )
+        );
+        // Ignore tiny accidental jitter on initial tap
+        if (Math.hypot(vecX, vecY) < 6) return;
+
+        const mag = Math.min(1, Math.hypot(vecX, vecY) / 120);
+        const sign = vecX >= 0 ? 1 : -1;
+        const autoRot = Math.round(sign * Math.max(6, mag * 26));
+
+        updateIsolatedRegionById(activeIsolatedId, (r) => ({
+          ...r,
+          dragVectorX: vecX,
+          dragVectorY: vecY,
+          rotationAmpDeg: autoRot,
+        }));
+        return;
+      }
+    }
 
     if (dragAction === 'move') {
       if (activeLayer === 'mouth') {
@@ -437,6 +719,16 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
   const handleWheelZoom = (e: React.WheelEvent) => {
     if (selectedLayer === 'none' || selectedLayer === 'tracker') return;
     e.preventDefault();
+
+    if (selectedLayer === 'isolated-region' && activeRegionId) {
+      const step = e.deltaY < 0 ? 6 : -6;
+      updateIsolatedRegionById(activeRegionId, (r) => ({
+        ...r,
+        radiusPx: Math.max(24, Math.min(220, r.radiusPx + step)),
+      }));
+      return;
+    }
+
     const delta = e.deltaY < 0 ? 0.08 : -0.08;
 
     if (selectedLayer === 'mouth' || selectedLayer === 'lip-segment') {
@@ -488,13 +780,156 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
-      className="absolute inset-0 z-20 select-none overflow-hidden touch-none cursor-grab active:cursor-grabbing"
+      className={`absolute inset-0 z-20 select-none overflow-hidden touch-none ${
+        selectedLayer === 'isolated-region'
+          ? 'cursor-crosshair'
+          : 'cursor-grab active:cursor-grabbing'
+      }`}
     >
-      {/* Clean Direct-Manipulation Handle Box ONLY when paused & actively editing a layer (Zero floating clutter!) */}
+      {/* Interactive Tap-and-Drag Element Isolation Handles when 'isolated-region' is selected */}
+      {selectedLayer === 'isolated-region' &&
+        isolatedRegions.map((reg, idx) => {
+          const isSelected =
+            reg.id === activeRegionId ||
+            (!activeRegionId && idx === isolatedRegions.length - 1);
+          const widthPct = Math.max(6, Math.min(48, (reg.radiusPx * 2 * 100) / 1280));
+          const heightPct = Math.max(8, Math.min(58, (reg.radiusPx * 2 * 100) / 720));
+          const tipX = Math.max(
+            3,
+            Math.min(97, (reg.anchorX + reg.dragVectorX / 1280) * 100)
+          );
+          const tipY = Math.max(
+            3,
+            Math.min(97, (reg.anchorY + reg.dragVectorY / 720) * 100)
+          );
+
+          return (
+            <React.Fragment key={reg.id}>
+              {/* SVG Motion Vector Line from Anchor to Drag Handle */}
+              <svg className="absolute inset-0 w-full h-full pointer-events-none z-10">
+                <defs>
+                  <marker
+                    id={`arrow-${reg.id}`}
+                    markerWidth="6"
+                    markerHeight="6"
+                    refX="4"
+                    refY="3"
+                    orient="auto"
+                  >
+                    <path
+                      d="M0,0 L6,3 L0,6 Z"
+                      fill={isSelected ? '#10b981' : '#38bdf8'}
+                    />
+                  </marker>
+                </defs>
+                <line
+                  x1={`${reg.anchorX * 100}%`}
+                  y1={`${reg.anchorY * 100}%`}
+                  x2={`${tipX}%`}
+                  y2={`${tipY}%`}
+                  stroke={isSelected ? '#10b981' : '#38bdf8'}
+                  strokeWidth={isSelected ? '2.2' : '1.5'}
+                  strokeDasharray="4 3"
+                  markerEnd={`url(#arrow-${reg.id})`}
+                />
+              </svg>
+
+              {/* Isolated Element Feathered Zone Ring */}
+              <div
+                style={{
+                  left: `${reg.anchorX * 100}%`,
+                  top: `${reg.anchorY * 100}%`,
+                  width: `${widthPct}%`,
+                  height: `${heightPct}%`,
+                  transform: 'translate(-50%, -50%)',
+                }}
+                onPointerDown={(e) =>
+                  beginIsolatedRegionPointerDown(e, 'isolate-move', reg)
+                }
+                className={`absolute rounded-full border transition-all z-20 ${
+                  !reg.enabled
+                    ? 'border-zinc-500/50 bg-zinc-900/10'
+                    : isSelected
+                    ? 'border-emerald-400 border-dashed bg-emerald-500/10 shadow-[0_0_20px_rgba(16,185,129,0.25)]'
+                    : 'border-sky-400/70 border-dashed bg-sky-500/5'
+                }`}
+              >
+                {/* Center Pin Handle (Tap & Drag to Reposition Isolated Element) */}
+                <div
+                  onPointerDown={(e) =>
+                    beginIsolatedRegionPointerDown(e, 'isolate-move', reg)
+                  }
+                  title="Tap & Drag to Move Isolated Area"
+                  className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-5 h-5 rounded-full flex items-center justify-center shadow-md cursor-move ${
+                    isSelected
+                      ? 'bg-emerald-500 text-zinc-950 ring-2 ring-white'
+                      : 'bg-sky-500 text-zinc-950'
+                  }`}
+                >
+                  <Move className="w-2.5 h-2.5" />
+                </div>
+
+                {/* Right Edge Radius Resize Handle */}
+                {isSelected && (
+                  <div
+                    onPointerDown={(e) =>
+                      beginIsolatedRegionPointerDown(e, 'isolate-radius', reg)
+                    }
+                    title="Drag to Resize Isolation Radius"
+                    className="absolute right-0 top-1/2 translate-x-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full bg-white border-2 border-emerald-600 shadow cursor-ew-resize"
+                  />
+                )}
+
+                {/* Delete Pin Button */}
+                {isSelected && (
+                  <button
+                    type="button"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteIsolatedRegionById(reg.id);
+                    }}
+                    title="আইসোলেট পিন ডিলিট করুন"
+                    className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-rose-600 hover:bg-rose-500 text-white shadow flex items-center justify-center cursor-pointer"
+                  >
+                    <Trash2 className="w-2.5 h-2.5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Tap-and-Drag Motion Direction & Amplitude Handle */}
+              <div
+                style={{
+                  left: `${tipX}%`,
+                  top: `${tipY}%`,
+                  transform: 'translate(-50%, -50%)',
+                }}
+                onPointerDown={(e) =>
+                  beginIsolatedRegionPointerDown(
+                    e,
+                    'isolate-create-or-vector',
+                    reg
+                  )
+                }
+                title="Tap & Drag to Animate Movement Direction & Amplitude"
+                className={`absolute z-30 w-6 h-6 rounded-full flex items-center justify-center shadow-lg cursor-grab active:cursor-grabbing transition-transform hover:scale-110 ${
+                  isSelected
+                    ? 'bg-amber-400 text-zinc-950 ring-2 ring-white'
+                    : 'bg-sky-400 text-zinc-950'
+                }`}
+              >
+                <Navigation className="w-3 h-3 rotate-45" />
+              </div>
+            </React.Fragment>
+          );
+        })}
+
+      {/* Clean Direct-Manipulation Handle Box ONLY when paused & actively editing a standard layer (Zero floating clutter!) */}
       {!isPlaying &&
         selectedLayer !== 'none' &&
         selectedLayer !== 'background' &&
         selectedLayer !== 'tracker' &&
+        selectedLayer !== 'isolated-region' &&
         activeBox && (
           <div
             style={{
@@ -533,30 +968,30 @@ export const InteractiveStageOverlay: React.FC<InteractiveStageOverlayProps> = (
 
             {/* 4 Corner Scale / Zoom Handles */}
             {(['nw', 'ne', 'sw', 'se'] as const).map((corner) => {
-                const posClass =
-                  corner === 'nw'
-                    ? '-top-1.5 -left-1.5 cursor-nwse-resize'
-                    : corner === 'ne'
-                    ? '-top-1.5 -right-1.5 cursor-nesw-resize'
-                    : corner === 'sw'
-                    ? '-bottom-1.5 -left-1.5 cursor-nesw-resize'
-                    : '-bottom-1.5 -right-1.5 cursor-nwse-resize';
-                return (
-                  <div
-                    key={corner}
-                    onPointerDown={(e) =>
-                      beginPointerTransform(
-                        e,
-                        'scale',
-                        selectedLayer,
-                        selectedOverlayId
-                      )
-                    }
-                    title="Drag Corner to Scale / Zoom"
-                    className={`absolute ${posClass} w-3 h-3 rounded-sm bg-white border border-zinc-900 shadow`}
-                  />
-                );
-              })}
+              const posClass =
+                corner === 'nw'
+                  ? '-top-1.5 -left-1.5 cursor-nwse-resize'
+                  : corner === 'ne'
+                  ? '-top-1.5 -right-1.5 cursor-nesw-resize'
+                  : corner === 'sw'
+                  ? '-bottom-1.5 -left-1.5 cursor-nesw-resize'
+                  : '-bottom-1.5 -right-1.5 cursor-nwse-resize';
+              return (
+                <div
+                  key={corner}
+                  onPointerDown={(e) =>
+                    beginPointerTransform(
+                      e,
+                      'scale',
+                      selectedLayer,
+                      selectedOverlayId
+                    )
+                  }
+                  title="Drag Corner to Scale / Zoom"
+                  className={`absolute ${posClass} w-3 h-3 rounded-sm bg-white border border-zinc-900 shadow`}
+                />
+              );
+            })}
 
             {/* Quick Delete Corner Badge ONLY when an imported overlay or imported character is selected */}
             {selectedLayer === 'overlay' && selectedOverlay && (

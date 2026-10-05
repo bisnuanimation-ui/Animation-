@@ -3,6 +3,7 @@ import {
   CharacterOverlayElement,
   DEFAULT_PROCEDURAL_ANIMATION,
   EngineConfig,
+  IsolatedMotionRegion,
   LipstickStyleConfig,
   MouthAnchorConfig,
   MouthChartStyleId,
@@ -329,6 +330,24 @@ function applyDeterministicVideoCartoonFilter(
   ctx.restore();
 }
 
+// Smart real-time mouth co-articulation state so phoneme transitions glide smoothly without snapping
+const smartMouthMorphState = {
+  openFactor: 1.0,
+  widthFactor: 1.0,
+  jawGlideY: 0.0,
+};
+
+// Smart real-time 2nd-order Spring-Damper + Follow-Through state for Character & Mouth Lifting
+const smartLiftingPhysicsState = {
+  liftPx: 0,
+  velocityPx: 0,
+  followLiftPx: 0,
+  followVelPx: 0,
+  squashAmt: 0,
+  arcPhase: 0,
+  lastFrameIdx: -1,
+};
+
 export function drawVisemeMouth(
   ctx: CanvasRenderingContext2D,
   viseme: VisemeCode,
@@ -345,19 +364,43 @@ export function drawVisemeMouth(
   lowerLipOffsetY = 0
 ) {
   ctx.save();
-  ctx.translate(x, y);
+
+  // Dynamic waveform + phoneme co-articulation smoothing so the mouth layer animates fluidly
+  const meta = VISEME_LIBRARY[viseme] || VISEME_LIBRARY[VisemeCode.DROP];
+  const isSilentDrop = viseme === VisemeCode.DROP || waveformRms <= 0.012;
+
+  const targetOpenFactor = isSilentDrop
+    ? 0.86
+    : Math.max(
+        0.76,
+        Math.min(1.3, 0.76 + waveformRms * 0.54 + meta.mouthOpenness * 0.14)
+      );
+  const targetWidthFactor = isSilentDrop
+    ? 0.96
+    : Math.max(
+        0.9,
+        Math.min(1.12, 0.92 + waveformRms * 0.12 + (meta.mouthWidth - 0.85) * 0.22)
+      );
+  const targetJawGlideY = isSilentDrop
+    ? 0
+    : meta.mouthOpenness * 2.8 + waveformRms * 2.2;
+
+  // Asymmetric spring interpolation: crisp syllable opening, feather-smooth closing
+  const openLerp = targetOpenFactor > smartMouthMorphState.openFactor ? 0.48 : 0.32;
+  smartMouthMorphState.openFactor +=
+    (targetOpenFactor - smartMouthMorphState.openFactor) * openLerp;
+  smartMouthMorphState.widthFactor +=
+    (targetWidthFactor - smartMouthMorphState.widthFactor) * 0.38;
+  smartMouthMorphState.jawGlideY +=
+    (targetJawGlideY - smartMouthMorphState.jawGlideY) * 0.36;
+
+  const waveOpenFactor = smartMouthMorphState.openFactor;
+  const waveWidthFactor = smartMouthMorphState.widthFactor;
+
+  ctx.translate(x, y + smartMouthMorphState.jawGlideY * scale);
   if (rotationDeg !== 0) {
     ctx.rotate((rotationDeg * Math.PI) / 180);
   }
-
-  // Dynamic waveform modulation so the smaller mouth layer animates smoothly with audio output
-  const isSilentDrop = viseme === VisemeCode.DROP || waveformRms <= 0.015;
-  const waveOpenFactor = isSilentDrop
-    ? 1
-    : Math.max(0.76, Math.min(1.32, 0.78 + waveformRms * 0.68));
-  const waveWidthFactor = isSilentDrop
-    ? 1
-    : Math.max(0.92, Math.min(1.12, 0.96 + waveformRms * 0.16));
 
   ctx.scale(scale * waveWidthFactor, scale * waveOpenFactor);
 
@@ -1559,6 +1602,138 @@ function drawProceduralFoliageAndLeaves(
   ctx.restore();
 }
 
+let isolatedSnapshotCanvas: HTMLCanvasElement | null = null;
+let isolatedSnapshotCtx: CanvasRenderingContext2D | null = null;
+
+/**
+ * Selectively isolates circular/elliptical regions of a static image and animates
+ * each isolated element with natural movement (pendulum sway, sine float, audio bounce,
+ * circular orbit, or manual pose) controlled by intuitive tap-and-drag vectors.
+ */
+function renderIsolatedMotionRegions(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  regions: IsolatedMotionRegion[],
+  currentFrame: AudioAnalysisFrame,
+  config: EngineConfig,
+  timeSec: number
+) {
+  const activeRegions = regions.filter((r) => r.enabled);
+  if (activeRegions.length === 0) return;
+
+  if (!isolatedSnapshotCanvas) {
+    isolatedSnapshotCanvas = document.createElement('canvas');
+  }
+  if (
+    isolatedSnapshotCanvas.width !== width ||
+    isolatedSnapshotCanvas.height !== height
+  ) {
+    isolatedSnapshotCanvas.width = width;
+    isolatedSnapshotCanvas.height = height;
+    isolatedSnapshotCtx = isolatedSnapshotCanvas.getContext('2d');
+  }
+  if (!isolatedSnapshotCtx) return;
+
+  // Capture clean snapshot of the static scene before moving isolated parts
+  isolatedSnapshotCtx.clearRect(0, 0, width, height);
+  isolatedSnapshotCtx.drawImage(ctx.canvas, 0, 0, width, height);
+
+  const scaleX = width / 1280;
+  const scaleY = height / 720;
+
+  activeRegions.forEach((reg, idx) => {
+    const cx = reg.anchorX * width;
+    const cy = reg.anchorY * height;
+    const r = Math.max(18, reg.radiusPx * scaleY);
+    const omega = Math.max(0.25, reg.speedHz || 1.3) * Math.PI * 2;
+    const seed = idx * 0.85;
+
+    let dx = 0;
+    let dy = 0;
+    let rotRad = 0;
+
+    if (reg.motionType === 'pendulum-sway') {
+      const s = Math.sin(timeSec * omega + seed);
+      dx = reg.dragVectorX * s * scaleX;
+      dy = reg.dragVectorY * s * scaleY;
+      rotRad = ((reg.rotationAmpDeg * s) * Math.PI) / 180;
+    } else if (reg.motionType === 'sine-float') {
+      const s = Math.sin(timeSec * omega + seed);
+      const c = Math.cos(timeSec * omega * 0.78 + seed);
+      dx = reg.dragVectorX * s * scaleX;
+      dy = reg.dragVectorY * c * scaleY;
+      rotRad = ((reg.rotationAmpDeg * 0.55 * s) * Math.PI) / 180;
+    } else if (reg.motionType === 'audio-bounce') {
+      const audioBoost = currentFrame.isDropped
+        ? 0
+        : Math.min(1.35, currentFrame.rms * 1.75);
+      const idleSubtle = Math.sin(timeSec * omega + seed) * 0.22;
+      const factor = audioBoost + idleSubtle;
+      dx = reg.dragVectorX * factor * scaleX;
+      dy = reg.dragVectorY * factor * scaleY;
+      rotRad = ((reg.rotationAmpDeg * factor) * Math.PI) / 180;
+    } else if (reg.motionType === 'circular-orbit') {
+      dx = reg.dragVectorX * Math.cos(timeSec * omega + seed) * scaleX;
+      dy = reg.dragVectorY * Math.sin(timeSec * omega + seed) * scaleY;
+      rotRad =
+        ((reg.rotationAmpDeg * Math.sin(timeSec * omega + seed)) * Math.PI) /
+        180;
+    } else {
+      // 'manual-pose'
+      dx = reg.dragVectorX * scaleX;
+      dy = reg.dragVectorY * scaleY;
+      rotRad = (reg.rotationAmpDeg * Math.PI) / 180;
+    }
+
+    // 1. Optional background infill under the original position when the element moves away
+    if (
+      reg.patchInfill &&
+      (Math.hypot(dx, dy) > 1.5 || Math.abs(rotRad) > 0.02)
+    ) {
+      ctx.save();
+      const bgFill =
+        config.background.mode === 'green-screen'
+          ? '#00FF00'
+          : config.background.color1 || '#D8D4CE';
+      const grad = ctx.createRadialGradient(cx, cy, r * 0.15, cx, cy, r * 0.96);
+      grad.addColorStop(0, bgFill);
+      grad.addColorStop(0.75, bgFill);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.globalAlpha = 0.82;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * 0.96, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // 2. Draw the isolated circular patch at its new animated position & pivot rotation
+    ctx.save();
+    ctx.translate(cx + dx, cy + dy);
+    ctx.rotate(rotRad);
+
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.clip();
+
+    ctx.drawImage(
+      isolatedSnapshotCanvas!,
+      cx - r,
+      cy - r,
+      r * 2,
+      r * 2,
+      -r,
+      -r,
+      r * 2,
+      r * 2
+    );
+
+    ctx.restore();
+  });
+}
+
 export function renderStudioStage(
   ctx: CanvasRenderingContext2D,
   width: number,
@@ -1691,12 +1866,96 @@ export function renderStudioStage(
   const charRotRad = ((config.characterTransform.rotationDeg || 0) * Math.PI) / 180;
   const charFlipX = config.characterTransform.flipX ? -1 : 1;
 
-  // Compute customizable Lifting Layer offset when liftingLayer is enabled and maxLiftPx > 0
-  const isLiftingLayerActive = config.layers.liftingLayer !== false && config.maxLiftPx > 0;
+  // =========================================================================
+  // SMART SMOOTH SPRING-DAMPER LIFTING ENGINE (Zero Robotic Step-Jumps!)
+  // =========================================================================
+  const isLiftingLayerActive =
+    config.layers.liftingLayer !== false && config.maxLiftPx > 0;
   const keyLiftVal = config.perKeyLiftPx?.[currentFrame.viseme] ?? 0;
-  const liftFactor = isLiftingLayerActive ? Math.min(1.8, config.maxLiftPx / 20) : 0;
-  const activeLiftOffset =
-    !isLiftingLayerActive || currentFrame.isDropped ? 0 : keyLiftVal * liftFactor * 0.55;
+  const liftFactor = isLiftingLayerActive
+    ? Math.min(1.8, config.maxLiftPx / 20)
+    : 0;
+
+  // Combine pre-smoothed audio contour (`currentFrame.liftY`) with per-key lift and live RMS envelope
+  const rmsContour = currentFrame.isDropped
+    ? 0
+    : Math.max(0.35, Math.min(1.18, 0.45 + currentFrame.rms * 0.95));
+  const rawKeyTarget =
+    !isLiftingLayerActive || currentFrame.isDropped
+      ? 0
+      : keyLiftVal * liftFactor * 0.56 * rmsContour;
+  const preSmoothedFrameLift = isLiftingLayerActive
+    ? (currentFrame.liftY || 0) * 0.62
+    : 0;
+  const desiredLiftTarget = !isLiftingLayerActive
+    ? 0
+    : preSmoothedFrameLift > 0
+    ? preSmoothedFrameLift * 0.65 + rawKeyTarget * 0.35
+    : rawKeyTarget;
+
+  const curveMode = config.liftingCurveMode || 'smart-organic';
+  const smoothnessNorm = Math.max(
+    0,
+    Math.min(1, (config.liftingSmoothness ?? 88) / 100)
+  );
+
+  if (!isLiftingLayerActive) {
+    smartLiftingPhysicsState.liftPx = 0;
+    smartLiftingPhysicsState.velocityPx = 0;
+    smartLiftingPhysicsState.followLiftPx = 0;
+    smartLiftingPhysicsState.followVelPx = 0;
+    smartLiftingPhysicsState.squashAmt = 0;
+  } else if (curveMode === 'classic-linear' && smoothnessNorm < 0.15) {
+    smartLiftingPhysicsState.liftPx = desiredLiftTarget;
+    smartLiftingPhysicsState.followLiftPx = desiredLiftTarget;
+    smartLiftingPhysicsState.velocityPx = 0;
+  } else {
+    // Second-Order Spring-Damper with Asymmetric Attack & Feather-Soft Landing
+    const isRising = desiredLiftTarget > smartLiftingPhysicsState.liftPx;
+    const baseStiffness =
+      curveMode === 'spring-bounce'
+        ? 0.32
+        : curveMode === 'feather-glide'
+        ? 0.14
+        : 0.22 - smoothnessNorm * 0.07;
+    const stiffness = isRising
+      ? baseStiffness * 1.28
+      : baseStiffness * (0.68 - smoothnessNorm * 0.16);
+    const damping =
+      curveMode === 'spring-bounce'
+        ? 0.72
+        : curveMode === 'feather-glide'
+        ? 0.82
+        : 0.76 + smoothnessNorm * 0.08;
+
+    const force =
+      (desiredLiftTarget - smartLiftingPhysicsState.liftPx) * stiffness;
+    smartLiftingPhysicsState.velocityPx =
+      smartLiftingPhysicsState.velocityPx * damping + force;
+    smartLiftingPhysicsState.liftPx += smartLiftingPhysicsState.velocityPx;
+
+    if (smartLiftingPhysicsState.liftPx < 0.04 && desiredLiftTarget === 0) {
+      smartLiftingPhysicsState.liftPx = 0;
+      smartLiftingPhysicsState.velocityPx = 0;
+    } else if (smartLiftingPhysicsState.liftPx < 0) {
+      smartLiftingPhysicsState.liftPx = 0;
+      smartLiftingPhysicsState.velocityPx *= 0.25;
+    }
+
+    // Secondary Follow-Through Spring (delayed overlapping action for natural head/mouth follow-through)
+    const followForce =
+      (smartLiftingPhysicsState.liftPx -
+        smartLiftingPhysicsState.followLiftPx) *
+      0.19;
+    smartLiftingPhysicsState.followVelPx =
+      smartLiftingPhysicsState.followVelPx * 0.78 + followForce;
+    smartLiftingPhysicsState.followLiftPx +=
+      smartLiftingPhysicsState.followVelPx;
+  }
+
+  const activeLiftOffset = smartLiftingPhysicsState.liftPx;
+  const followLiftOffset = smartLiftingPhysicsState.followLiftPx;
+  const liftVelocity = smartLiftingPhysicsState.velocityPx;
 
   const targetMode = config.liftingTarget || 'character-and-mouth';
   const bodyLiftY =
@@ -1704,20 +1963,48 @@ export function renderStudioStage(
       ? 0
       : targetMode === 'character-only'
       ? activeLiftOffset * 0.85
-      : activeLiftOffset * 0.6;
+      : activeLiftOffset * 0.62;
   const jawDrop =
-    targetMode === 'character-only' ? 0 : activeLiftOffset;
+    targetMode === 'character-only' ? 0 : followLiftOffset;
 
-  // Apply mouth-only vertical lift to effectiveMouthAnchor when in mouth-only mode on custom characters/videos
-  if (targetMode === 'mouth-only' && activeLiftOffset > 0) {
-    effectiveMouthAnchor.offsetY -= activeLiftOffset * 0.45;
+  // Natural S-curve micro-arc & expressive nod so lifting never looks like a stiff vertical elevator
+  smartLiftingPhysicsState.arcPhase += 0.09;
+  const liftRatio =
+    isLiftingLayerActive && config.maxLiftPx > 0
+      ? Math.min(1, activeLiftOffset / Math.max(12, config.maxLiftPx * 0.75))
+      : 0;
+  const smartLiftArcX =
+    isLiftingLayerActive && curveMode !== 'classic-linear' && targetMode !== 'mouth-only'
+      ? Math.sin(smartLiftingPhysicsState.arcPhase) * liftRatio * 2.2 * (width / 1280)
+      : 0;
+  const smartLiftTiltRad =
+    isLiftingLayerActive && curveMode !== 'classic-linear' && targetMode !== 'mouth-only'
+      ? ((liftVelocity * 0.14 + Math.cos(smartLiftingPhysicsState.arcPhase) * liftRatio * 0.85) *
+          Math.PI) /
+        180
+      : 0;
+
+  // Apply smooth mouth-only vertical lift to effectiveMouthAnchor when in mouth-only mode
+  if (targetMode === 'mouth-only' && followLiftOffset > 0) {
+    effectiveMouthAnchor.offsetY -= followLiftOffset * 0.48;
   }
 
-  const squashAmt =
-    isLiftingLayerActive && config.squashIntensity > 0 && activeLiftOffset > 0
-      ? Math.min(0.22, (activeLiftOffset / 30) * config.squashIntensity)
+  // Smoothly interpolated Squash & Stretch coupled to both lift height and spring velocity
+  const targetSquashAmt =
+    isLiftingLayerActive && config.squashIntensity > 0
+      ? Math.max(
+          -0.06,
+          Math.min(
+            0.2,
+            ((activeLiftOffset / 30) * 0.82 + (liftVelocity / 12) * 0.25) *
+              config.squashIntensity
+          )
+        )
       : 0;
-  const stretchScaleX = 1 - squashAmt * 0.55;
+  smartLiftingPhysicsState.squashAmt +=
+    (targetSquashAmt - smartLiftingPhysicsState.squashAmt) * 0.28;
+  const squashAmt = smartLiftingPhysicsState.squashAmt;
+  const stretchScaleX = 1 - squashAmt * 0.52;
   const stretchScaleY = 1 + squashAmt;
 
   const isBlinking = false;
@@ -1730,15 +2017,15 @@ export function renderStudioStage(
 
   if (config.layers.characterLayer) {
     ctx.save();
-    // Apply subtle procedural head/body sway on custom characters or pass procedural offsets to rig characters
+    // Apply subtle procedural head/body sway + smart lifting S-curve micro-arc
     const customCharTiltRad =
-      config.characterPreset === 'custom-character' && procOffsets.active
+      (config.characterPreset === 'custom-character' && procOffsets.active
         ? procOffsets.headTiltRad * 0.65
-        : 0;
+        : 0) + smartLiftTiltRad;
     const customCharOffsetX =
-      config.characterPreset === 'custom-character' && procOffsets.active
+      (config.characterPreset === 'custom-character' && procOffsets.active
         ? procOffsets.headOffsetX * (width / 1280)
-        : 0;
+        : 0) + smartLiftArcX;
     const customCharOffsetY =
       config.characterPreset === 'custom-character' && procOffsets.active
         ? procOffsets.headOffsetY * (height / 720)
@@ -1788,6 +2075,28 @@ export function renderStudioStage(
     }
 
     ctx.restore();
+  }
+
+  // =========================================================================
+  // LAYER 2B: SELECTIVELY ISOLATED & ANIMATED STATIC IMAGE ELEMENTS
+  //           (Tap-and-Drag Region Isolation + Natural Pendulum/Sine/Audio Motion!)
+  // =========================================================================
+  const isolatedRegions = config.proceduralAnimation?.isolatedRegions;
+  if (
+    isolatedRegions &&
+    isolatedRegions.length > 0 &&
+    config.layers.proceduralLayer !== false
+  ) {
+    renderIsolatedMotionRegions(
+      ctx,
+      width,
+      height,
+      isolatedRegions,
+      currentFrame,
+      config,
+      procOffsets.timeSec ||
+        (currentFrame.timeSec ?? currentFrame.frame / Math.max(1, config.fps))
+    );
   }
 
   // =========================================================================

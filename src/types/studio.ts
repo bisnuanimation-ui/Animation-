@@ -184,6 +184,7 @@ export type SelectedCanvasLayer =
   | 'character'
   | 'overlay'
   | 'background'
+  | 'isolated-region'
   | 'none';
 
 export type PerKeyLiftMap = Record<VisemeCode, number>;
@@ -286,10 +287,38 @@ export interface MouthTrackerConfig {
 
 export type LiftingTargetMode = 'mouth-only' | 'character-and-mouth' | 'character-only';
 
+export type SmartLiftingCurveMode =
+  | 'smart-organic'
+  | 'spring-bounce'
+  | 'feather-glide'
+  | 'classic-linear';
+
 export type ProceduralTriggerMode =
   | 'audio-idle-hybrid'
   | 'audio-frequency'
   | 'idle-sine';
+
+export type IsolatedPinMotionType =
+  | 'pendulum-sway'
+  | 'sine-float'
+  | 'audio-bounce'
+  | 'circular-orbit'
+  | 'manual-pose';
+
+export interface IsolatedMotionRegion {
+  id: string;
+  label: string;                // e.g. "Hand / Arm", "Hair Lock", "Head / Prop"
+  anchorX: number;              // Normalized stage X (0.05 to 0.95)
+  anchorY: number;              // Normalized stage Y (0.05 to 0.95)
+  radiusPx: number;             // Isolation radius in reference 1280x720 px (24 to 220)
+  dragVectorX: number;          // Tap-and-drag movement vector X (-220 to +220 px)
+  dragVectorY: number;          // Tap-and-drag movement vector Y (-220 to +220 px)
+  rotationAmpDeg: number;       // Pivot rotation angle (-55 to +55 deg)
+  speedHz: number;              // Animation speed (0.3 to 3.5 Hz)
+  motionType: IsolatedPinMotionType;
+  patchInfill: boolean;         // Softly infills original background under isolated moving patch
+  enabled: boolean;
+}
 
 export interface ProceduralAnimationConfig {
   enabled: boolean;
@@ -301,6 +330,7 @@ export interface ProceduralAnimationConfig {
   leavesCount: number;             // 0 to 28 (default 12)
   waveSpeedHz: number;             // 0.3 to 3.5 (default 1.3)
   physicsSpringDamping: number;    // 10 to 95 (default 68)
+  isolatedRegions?: IsolatedMotionRegion[];
 }
 
 export const DEFAULT_PROCEDURAL_ANIMATION: ProceduralAnimationConfig = {
@@ -313,6 +343,7 @@ export const DEFAULT_PROCEDURAL_ANIMATION: ProceduralAnimationConfig = {
   leavesCount: 12,
   waveSpeedHz: 1.3,
   physicsSpringDamping: 68,
+  isolatedRegions: [],
 };
 
 export interface LocalStudioProject {
@@ -353,6 +384,9 @@ export interface EngineConfig {
   peakThresholdDb: number;      // e.g. -14 dB (triggers wide open AEI / O + max lift)
   maxLiftPx: number;            // Global master lift multiplier / cap (px)
   liftingTarget?: LiftingTargetMode; // Which part lifts: mouth-only, character-and-mouth, or character-only
+  liftingCurveMode?: SmartLiftingCurveMode; // Smart spring/easing mode for lifting & speech
+  liftingSmoothness?: number;   // 0 to 100% spring-damper & Gaussian curve smoothing (default 88)
+  smartAutoListing?: boolean;   // Smart phoneme co-articulation to prevent robotic mouth flicker
   perKeyLiftPx: PerKeyLiftMap;  // Individual lifting (px) for each of the 12 mouth keys!
   squashIntensity: number;      // 0.0 to 0.25 squash & stretch factor
   holdSmoothingFrames: number;  // Minimum frames to hold a viseme to prevent jitter

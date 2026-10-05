@@ -193,12 +193,20 @@ export function analyzeAudioBuffer(
   const normFactor = maxObservedRms > 0.005 ? 0.95 / maxObservedRms : 1;
   const rawFrames: AudioAnalysisFrame[] = [];
   let prevViseme: VisemeCode = VisemeCode.DROP;
-  let smoothedLift = 0;
 
   for (let f = 0; f < totalFrames; f++) {
     const normRms = Math.min(1, rawRms[f] * normFactor);
     const prevRms = f > 0 ? Math.min(1, rawRms[f - 1] * normFactor) : 0;
     const nextRms = f < totalFrames - 1 ? Math.min(1, rawRms[f + 1] * normFactor) : normRms;
+
+    // 3-tap spectral smoothing to prevent robotic frame-to-frame consonant jitter
+    const prevZcr = f > 0 ? rawZcr[f - 1] : rawZcr[f];
+    const nextZcr = f < totalFrames - 1 ? rawZcr[f + 1] : rawZcr[f];
+    const smoothZcr = prevZcr * 0.22 + rawZcr[f] * 0.56 + nextZcr * 0.22;
+
+    const prevCent = f > 0 ? rawCentroid[f - 1] : rawCentroid[f];
+    const nextCent = f < totalFrames - 1 ? rawCentroid[f + 1] : rawCentroid[f];
+    const smoothCentroid = prevCent * 0.22 + rawCentroid[f] * 0.56 + nextCent * 0.22;
 
     const envelopeRms = prevRms * 0.25 + normRms * 0.5 + nextRms * 0.25;
     const db = amplitudeToDb(envelopeRms);
@@ -207,8 +215,8 @@ export function analyzeAudioBuffer(
     const { viseme, phase, isDropped } = resolveDeterministicViseme(
       db,
       deltaRms,
-      rawZcr[f],
-      rawCentroid[f],
+      smoothZcr,
+      smoothCentroid,
       prevViseme,
       config
     );
@@ -225,21 +233,9 @@ export function analyzeAudioBuffer(
     const risingBoost = !isDropped && deltaRms > 0 ? Math.min(0.35, deltaRms * 1.8) : 0;
     const targetLift = computeKeyLiftPx(viseme, isDropped, activeRatio, risingBoost, config);
 
-    if (targetLift > smoothedLift) {
-      smoothedLift = smoothedLift * 0.3 + targetLift * 0.7;
-    } else {
-      smoothedLift = smoothedLift * 0.5 + targetLift * 0.5;
-    }
-    if (smoothedLift < 0.35 || isDropped) smoothedLift = 0;
-
-    const stretchRaw = isDropped
-      ? 1.0
-      : 1.0 + (activeRatio * 0.11 + deltaRms * 0.18) * config.squashIntensity;
-    const squashStretch = Math.max(0.92, Math.min(1.15, Number(stretchRaw.toFixed(4))));
-
     const headTiltDeg = isDropped
       ? 0
-      : Number((Math.sin(f * 0.28) * activeRatio * 4.2).toFixed(2));
+      : Number((Math.sin(f * 0.26) * activeRatio * 4.2).toFixed(2));
     const browLiftPx = isDropped ? 0 : Number((activeRatio * 9.5).toFixed(2));
 
     rawFrames.push({
@@ -248,20 +244,41 @@ export function analyzeAudioBuffer(
       rms: Number(envelopeRms.toFixed(4)),
       db: Number(db.toFixed(1)),
       deltaRms: Number(deltaRms.toFixed(4)),
-      zcr: Number(rawZcr[f].toFixed(3)),
-      centroid: Number(rawCentroid[f].toFixed(3)),
+      zcr: Number(smoothZcr.toFixed(3)),
+      centroid: Number(smoothCentroid.toFixed(3)),
       phase,
       viseme,
       isDropped,
-      liftY: Number(smoothedLift.toFixed(2)),
-      squashStretch,
+      liftY: Number(targetLift.toFixed(2)),
+      squashStretch: 1.0,
       headTiltDeg,
       browLiftPx,
     });
   }
 
-  // Hold smoothing on active (non-dropped) frames so mouth chart shapes read cleanly
-  const holdMin = Math.max(1, config.holdSmoothingFrames);
+  // Smart Auto-Listing Co-articulation: bridge 1-frame micro-drops inside spoken words
+  if (config.smartAutoListing !== false && rawFrames.length > 3) {
+    for (let i = 1; i < rawFrames.length - 1; i++) {
+      if (
+        rawFrames[i].isDropped &&
+        !rawFrames[i - 1].isDropped &&
+        !rawFrames[i + 1].isDropped
+      ) {
+        rawFrames[i].isDropped = false;
+        rawFrames[i].viseme = VisemeCode.BMP;
+        rawFrames[i].phase = MotionPhase.HOLD;
+        rawFrames[i].liftY = Number(
+          ((rawFrames[i - 1].liftY + rawFrames[i + 1].liftY) * 0.38).toFixed(2)
+        );
+      }
+    }
+  }
+
+  // Hold smoothing on active (non-dropped) frames so mouth chart shapes read cleanly without robotic flicker
+  const holdMin = Math.max(
+    config.smartAutoListing !== false ? 2 : 1,
+    config.holdSmoothingFrames
+  );
   if (holdMin > 1 && rawFrames.length > holdMin) {
     let runStart = 0;
     for (let i = 1; i < rawFrames.length; i++) {
@@ -283,8 +300,155 @@ export function analyzeAudioBuffer(
     }
   }
 
+  // Apply Smart Organic Lifting & Squash-Stretch Envelope (Eliminates robotic step jumps!)
+  applySmartLiftingEnvelope(rawFrames, config);
+
   const cues = buildCuesFromFrames(rawFrames, config.fps);
   return { frames: rawFrames, cues };
+}
+
+/**
+ * Multi-pass Zero-Phase Gaussian + Spring-Damper Envelope Smoother for `liftY` and `squashStretch`.
+ * Ensures lifting rises organically with syllable energy and settles down like a feather (never snapping abruptly).
+ */
+export function applySmartLiftingEnvelope(
+  frames: AudioAnalysisFrame[],
+  config: EngineConfig
+): void {
+  const n = frames.length;
+  if (n === 0) return;
+
+  if (config.maxLiftPx <= 0 || config.layers.liftingLayer === false) {
+    for (let i = 0; i < n; i++) {
+      frames[i].liftY = 0;
+      frames[i].squashStretch = 1.0;
+    }
+    return;
+  }
+
+  const curveMode = config.liftingCurveMode || 'smart-organic';
+  const smoothnessPct = Math.max(0, Math.min(100, config.liftingSmoothness ?? 88));
+  const smoothFactor = smoothnessPct / 100;
+
+  // 1. Recompute raw target lift from final co-articulated viseme + audio RMS envelope
+  const rawTargets = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const fr = frames[i];
+    if (fr.isDropped || fr.viseme === VisemeCode.DROP) {
+      rawTargets[i] = 0;
+      continue;
+    }
+    const activeRatio = Math.max(
+      0.15,
+      Math.min(
+        1,
+        (fr.db - config.silenceThresholdDb) /
+          Math.max(6, config.peakThresholdDb - config.silenceThresholdDb)
+      )
+    );
+    const risingBoost = fr.deltaRms > 0 ? Math.min(0.32, fr.deltaRms * 1.6) : 0;
+    rawTargets[i] = computeKeyLiftPx(
+      fr.viseme,
+      false,
+      activeRatio,
+      risingBoost,
+      config
+    );
+  }
+
+  // 2. Shape syllable runs with a subtle natural bell-arch so flat cues still breathe organically
+  let segStart = 0;
+  for (let i = 1; i <= n; i++) {
+    const isEnd = i === n;
+    const prevDropped = rawTargets[segStart] <= 0.01;
+    const currDropped = !isEnd && rawTargets[i] <= 0.01;
+    if (isEnd || currDropped !== prevDropped) {
+      const segLen = i - segStart;
+      if (!prevDropped && segLen >= 3 && curveMode !== 'classic-linear') {
+        for (let k = segStart; k < i; k++) {
+          const u = (k - segStart + 0.5) / segLen; // 0..1 across active speech phrase
+          const arch = 0.72 + 0.36 * Math.sin(Math.PI * u);
+          rawTargets[k] *= arch;
+        }
+      }
+      segStart = i;
+    }
+  }
+
+  // 3. Asymmetric Attack/Release Spring-Damper Pass (No instant drop-to-zero snapping!)
+  const springFiltered = new Float32Array(n);
+  let pos = 0;
+  let vel = 0;
+
+  const isSpringy = curveMode === 'spring-bounce';
+  const isFeather = curveMode === 'feather-glide';
+  const stiffness = isSpringy
+    ? 0.34
+    : isFeather
+    ? 0.16
+    : 0.24 - smoothFactor * 0.08;
+  const damping = isSpringy
+    ? 0.68
+    : isFeather
+    ? 0.84
+    : 0.78 + smoothFactor * 0.06;
+
+  for (let i = 0; i < n; i++) {
+    const target = rawTargets[i];
+    if (curveMode === 'classic-linear' && smoothFactor < 0.15) {
+      springFiltered[i] = target;
+      continue;
+    }
+    // Faster attack when rising on a vowel, softer cushioned glide when releasing
+    const effectiveStiff =
+      target > pos ? stiffness * 1.35 : stiffness * (0.72 - smoothFactor * 0.18);
+    const force = (target - pos) * effectiveStiff;
+    vel = vel * damping + force;
+    pos += vel;
+    if (pos < 0) {
+      pos = 0;
+      vel *= 0.3;
+    }
+    springFiltered[i] = pos;
+  }
+
+  // 4. Zero-Phase Forward-Backward 5-Tap Gaussian Spline Pass for silky C2 continuity
+  const passes =
+    curveMode === 'classic-linear'
+      ? 0
+      : Math.max(1, Math.round(1 + smoothFactor * 3));
+  let smoothed = Float32Array.from(springFiltered);
+  const temp = new Float32Array(n);
+
+  for (let p = 0; p < passes; p++) {
+    for (let i = 0; i < n; i++) {
+      const m2 = smoothed[Math.max(0, i - 2)];
+      const m1 = smoothed[Math.max(0, i - 1)];
+      const c0 = smoothed[i];
+      const p1 = smoothed[Math.min(n - 1, i + 1)];
+      const p2 = smoothed[Math.min(n - 1, i + 2)];
+      temp[i] = m2 * 0.08 + m1 * 0.24 + c0 * 0.36 + p1 * 0.24 + p2 * 0.08;
+    }
+    smoothed.set(temp);
+  }
+
+  // 5. Write smooth liftY and velocity-coupled squash & stretch back to frames
+  for (let i = 0; i < n; i++) {
+    const liftVal = smoothed[i] < 0.08 ? 0 : smoothed[i];
+    frames[i].liftY = Number(liftVal.toFixed(2));
+
+    const prevLift = i > 0 ? smoothed[i - 1] : liftVal;
+    const liftVelocity = liftVal - prevLift;
+    const normLift = liftVal / Math.max(12, config.maxLiftPx);
+
+    // Volume-preserving squash & stretch driven by smooth lift + velocity (anticipation & cushion)
+    const stretchDelta =
+      (normLift * 0.09 + liftVelocity * 0.018) * config.squashIntensity;
+    frames[i].squashStretch = Math.max(
+      0.92,
+      Math.min(1.16, Number((1.0 + stretchDelta).toFixed(4)))
+    );
+  }
 }
 
 export function buildCuesFromFrames(frames: AudioAnalysisFrame[], fps: number): LipSyncCue[] {
@@ -366,6 +530,9 @@ export function applyCuesToFrames(
       }
     }
   }
+
+  // Smooth the resulting frame lifting curve so manual cue edits also transition smoothly!
+  applySmartLiftingEnvelope(updated, config);
 
   return updated;
 }
