@@ -1,0 +1,6 @@
+{
+  "name": "ToonSync 2D — Auto Lip-Sync & Character Lifting Studio",
+  "description": "Deterministic 2D animation studio workstation for automatic audio-peak lip-syncing, character lifting, video-to-2D rotoscoping, and ZIP sprite listing editing.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
